@@ -162,13 +162,13 @@ export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
 			}
 
 			const basePath = normalizePath(
-				options.auth.options.basePath ?? "/api/auth",
+				options!.auth.options.basePath ?? "/api/auth",
 			);
 			const extras = AuthModule.instanceExtras.get(name);
 
 			this.instances.set(name, {
 				name,
-				options,
+				options: options!,
 				basePath,
 				disableControllers: extras?.disableControllers ?? false,
 			});
@@ -217,7 +217,7 @@ export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
 
 			for (const provider of providers) {
 				// Check if this hook targets this specific instance
-				const hookTarget = Reflect.getMetadata(HOOK_KEY, provider.metatype);
+				const hookTarget = Reflect.getMetadata(HOOK_KEY, provider.metatype!);
 				// hookTarget is true (all instances) or a string (specific instance name)
 				if (hookTarget !== true && hookTarget !== instance.name) continue;
 
