@@ -22,10 +22,13 @@ type ExpressBodyParserModule = {
 
 export interface SkipBodyParsingMiddlewareOptions {
 	/**
-	 * The base path for Better Auth routes. Body parsing will be skipped for these routes.
-	 * @default "/api/auth"
+	 * @deprecated Use `basePaths` instead.
 	 */
 	basePath?: string;
+	/**
+	 * The base paths for Better Auth routes. Body parsing will be skipped for these routes.
+	 */
+	basePaths?: string[];
 	bodyParser?: ResolvedBodyParserOptions;
 }
 
@@ -243,8 +246,10 @@ export function handleFastifyTrustedOriginsCors(
 export function SkipBodyParsingMiddleware(
 	options: SkipBodyParsingMiddlewareOptions = {},
 ) {
-	const { basePath = "/api/auth", bodyParser = resolveBodyParserOptions() } =
-		options;
+	const basePaths =
+		options.basePaths ??
+		(options.basePath ? [options.basePath] : ["/api/auth"]);
+	const { bodyParser = resolveBodyParserOptions() } = options;
 	const express = getExpressBodyParser();
 
 	const {
@@ -266,7 +271,7 @@ export function SkipBodyParsingMiddleware(
 		: null;
 
 	return (req: RequestLike, res: ResponseLike, next: MiddlewareNext): void => {
-		if (matchesBasePath(req, basePath)) {
+		if (basePaths.some((bp) => matchesBasePath(req, bp))) {
 			next();
 			return;
 		}

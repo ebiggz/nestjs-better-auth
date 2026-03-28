@@ -1,8 +1,50 @@
-import { SetMetadata, createParamDecorator } from "@nestjs/common";
+import { Inject, SetMetadata, createParamDecorator } from "@nestjs/common";
 import type { CustomDecorator, ExecutionContext } from "@nestjs/common";
 import type { createAuthMiddleware } from "better-auth/api";
-import { AFTER_HOOK_KEY, BEFORE_HOOK_KEY, HOOK_KEY } from "./symbols.ts";
+import {
+	AFTER_HOOK_KEY,
+	AUTH_INSTANCE_NAME_KEY,
+	BEFORE_HOOK_KEY,
+	DEFAULT_AUTH_INSTANCE_NAME,
+	HOOK_KEY,
+	getAuthServiceToken,
+} from "./symbols.ts";
 import { getRequestFromContext } from "./utils.ts";
+
+/**
+ * Specifies which named auth instance a controller or route should use.
+ * Required in multi-instance setups to select the correct Better Auth instance.
+ *
+ * When only one auth instance is registered (no name or name='default'),
+ * this decorator is not needed.
+ *
+ * @param name - The name of the auth instance (as registered in AuthModule.forRoot)
+ * @example
+ * ```ts
+ * @UseAuth('employee')
+ * @Controller('admin')
+ * export class AdminController { ... }
+ * ```
+ */
+export const UseAuth = (name: string): CustomDecorator<symbol> =>
+	SetMetadata(AUTH_INSTANCE_NAME_KEY, name);
+
+/**
+ * Parameter decorator that injects a named AuthService instance.
+ * Use this to inject a specific auth instance in multi-instance setups.
+ *
+ * For the default (unnamed) instance, you can inject AuthService directly
+ * without this decorator.
+ *
+ * @param name - The name of the auth instance (defaults to the default instance)
+ * @example
+ * ```ts
+ * constructor(@InjectAuth('employee') private authService: AuthService) {}
+ * ```
+ */
+export const InjectAuth = (
+	name = DEFAULT_AUTH_INSTANCE_NAME,
+): ParameterDecorator => Inject(getAuthServiceToken(name));
 
 /**
  * Allows unauthenticated (anonymous) access to a route or controller.
@@ -183,5 +225,16 @@ export const AfterHook = (path?: `/${string}`): CustomDecorator<symbol> =>
 /**
  * Class decorator that marks a provider as containing hook methods.
  * Must be applied to classes that use BeforeHook or AfterHook decorators.
+ *
+ * In multi-instance setups, pass the instance name to scope hooks
+ * to a specific auth instance. Without a name, hooks apply to all instances.
+ *
+ * @param instanceName - Optional auth instance name to scope hooks to
+ * @example
+ * ```ts
+ * @Hook()              // Applies to all instances (or the single default instance)
+ * @Hook('employee')    // Only applies to the 'employee' auth instance
+ * ```
  */
-export const Hook = (): ClassDecorator => SetMetadata(HOOK_KEY, true);
+export const Hook = (instanceName?: string): ClassDecorator =>
+	SetMetadata(HOOK_KEY, instanceName ?? true);

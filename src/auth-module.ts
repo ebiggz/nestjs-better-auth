@@ -3,6 +3,7 @@ import type {
 	DynamicModule,
 	MiddlewareConsumer,
 	NestModule,
+	OnModuleDestroy,
 	OnModuleInit,
 } from "@nestjs/common";
 import {
@@ -11,6 +12,7 @@ import {
 	DiscoveryService,
 	HttpAdapterHost,
 	MetadataScanner,
+	ModuleRef,
 } from "@nestjs/core";
 import { toNodeHandler } from "better-auth/node";
 import { createAuthMiddleware } from "better-auth/api";
@@ -19,11 +21,10 @@ import type {
 	Response as ExpressResponse,
 } from "express";
 import {
-	type ASYNC_OPTIONS_TYPE,
+	type AuthModuleAsyncOptions,
+	type AuthModuleForRootOptions,
 	type AuthModuleOptions,
-	ConfigurableModuleClass,
 	MODULE_OPTIONS_TOKEN,
-	type OPTIONS_TYPE,
 } from "./auth-module-definition.ts";
 import { AuthService } from "./auth-service.ts";
 import { configureFastifyBodyParser } from "./fastify-body-parser.ts";
@@ -35,7 +36,15 @@ import {
 	matchesBasePath,
 	resolveBodyParserOptions,
 } from "./middlewares.ts";
-import { AFTER_HOOK_KEY, BEFORE_HOOK_KEY, HOOK_KEY } from "./symbols.ts";
+import {
+	AFTER_HOOK_KEY,
+	BEFORE_HOOK_KEY,
+	DEFAULT_AUTH_INSTANCE_NAME,
+	HOOK_KEY,
+	_authInstanceNames,
+	getAuthOptionsToken,
+	getAuthServiceToken,
+} from "./symbols.ts";
 import { AuthGuard } from "./auth-guard.ts";
 import { APP_GUARD } from "@nestjs/core";
 import { normalizePath } from "@nestjs/common/utils/shared.utils.js";
@@ -60,21 +69,45 @@ type AdapterResponse = ExpressResponse & {
 // biome-ignore lint/suspicious/noExplicitAny: i don't want to cause issues/breaking changes between different ways of setting up better-auth and even versions
 export type Auth = any;
 
+interface ResolvedAuthInstance {
+	name: string;
+	options: AuthModuleOptions;
+	basePath: string;
+	disableControllers: boolean;
+}
+
 /**
  * NestJS module that integrates the Auth library with NestJS applications.
  * Provides authentication middleware, hooks, and exception handling.
+ *
+ * Supports multiple named Better Auth instances for multi-app auth scenarios.
+ *
+ * @example Single instance:
+ * ```ts
+ * AuthModule.forRoot({ auth })
+ * ```
+ *
+ * @example Multiple instances:
+ * ```ts
+ * AuthModule.forRoot({ auth: customerAuth, name: 'customer' })
+ * AuthModule.forRoot({ auth: employeeAuth, name: 'employee' })
+ * ```
  */
 @Module({
 	imports: [DiscoveryModule],
-	providers: [AuthService],
-	exports: [AuthService],
 })
-export class AuthModule
-	extends ConfigurableModuleClass
-	implements NestModule, OnModuleInit
-{
+export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
+	/**
+	 * Per-instance extras that can't be stored in the options token
+	 * (because they're module-level concerns, not runtime options).
+	 */
+	private static readonly instanceExtras = new Map<
+		string,
+		{ disableControllers: boolean }
+	>();
+
 	private readonly logger = new Logger(AuthModule.name);
-	private readonly basePath: string;
+	private readonly instances = new Map<string, ResolvedAuthInstance>();
 
 	constructor(
 		@Inject(ApplicationConfig)
@@ -85,26 +118,47 @@ export class AuthModule
 		private readonly metadataScanner: MetadataScanner,
 		@Inject(HttpAdapterHost)
 		private readonly adapter: HttpAdapterHost,
-		@Inject(MODULE_OPTIONS_TOKEN)
-		private readonly options: AuthModuleOptions,
+		private readonly moduleRef: ModuleRef,
 	) {
-		super();
+		// Resolve all registered instances
+		for (const name of Array.from(_authInstanceNames)) {
+			const token = getAuthOptionsToken(name);
+			let options: AuthModuleOptions;
+			try {
+				options = this.moduleRef.get(token, { strict: false });
+			} catch {
+				continue; // Registered by a different application context
+			}
 
-		// Get basePath from options or use default
-		// - Ensure basePath starts with /
-		// - Ensure basePath doesn't end with /
-		this.basePath = normalizePath(
-			this.options.auth.options.basePath ?? "/api/auth",
-		);
+			const basePath = normalizePath(
+				options.auth.options.basePath ?? "/api/auth",
+			);
+			const extras = AuthModule.instanceExtras.get(name);
 
-		// Add exclusion to global prefix for Better Auth routes
-		const globalPrefixOptions = this.applicationConfig.getGlobalPrefixOptions();
-		this.applicationConfig.setGlobalPrefixOptions({
-			exclude: [
-				...(globalPrefixOptions.exclude ?? []),
-				...mapToExcludeRoute([this.basePath, `${this.basePath}/*path`]),
-			],
-		});
+			this.instances.set(name, {
+				name,
+				options,
+				basePath,
+				disableControllers: extras?.disableControllers ?? false,
+			});
+
+			// Add exclusion to global prefix for this instance's auth routes
+			const globalPrefixOptions =
+				this.applicationConfig.getGlobalPrefixOptions();
+			this.applicationConfig.setGlobalPrefixOptions({
+				exclude: [
+					...(globalPrefixOptions.exclude ?? []),
+					...mapToExcludeRoute([basePath, `${basePath}/*path`]),
+				],
+			});
+		}
+	}
+
+	onModuleDestroy(): void {
+		for (const name of Array.from(this.instances.keys())) {
+			_authInstanceNames.delete(name);
+			AuthModule.instanceExtras.delete(name);
+		}
 	}
 
 	onModuleInit(): void {
@@ -114,89 +168,95 @@ export class AuthModule
 				({ metatype }) => metatype && Reflect.getMetadata(HOOK_KEY, metatype),
 			);
 
-		const hasHookProviders = providers.length > 0;
-		const hooksConfigured =
-			typeof this.options.auth?.options?.hooks === "object";
+		if (providers.length === 0) return;
 
-		if (hasHookProviders && !hooksConfigured)
-			throw new Error(
-				"Detected @Hook providers but Better Auth 'hooks' are not configured. Add 'hooks: {}' to your betterAuth(...) options.",
-			);
+		for (const instance of Array.from(this.instances.values())) {
+			if (instance.disableControllers) continue;
 
-		if (!hooksConfigured) return;
+			// Prevent double hook initialization (can happen when multiple forRoot
+			// calls for the same module class cause onModuleInit to fire more than once)
+			const auth = instance.options.auth;
+			if (auth._nestjsHooksInitialized) continue;
+			auth._nestjsHooksInitialized = true;
 
-		for (const provider of providers) {
-			const providerPrototype = Object.getPrototypeOf(provider.instance);
-			const methods = this.metadataScanner.getAllMethodNames(providerPrototype);
+			const hooksConfigured =
+				typeof auth?.options?.hooks === "object";
 
-			for (const method of methods) {
-				const providerMethod = providerPrototype[method];
-				this.setupHooks(providerMethod, provider.instance);
+			for (const provider of providers) {
+				// Check if this hook targets this specific instance
+				const hookTarget = Reflect.getMetadata(HOOK_KEY, provider.metatype);
+				// hookTarget is true (all instances) or a string (specific instance name)
+				if (hookTarget !== true && hookTarget !== instance.name) continue;
+
+				if (!hooksConfigured) {
+					throw new Error(
+						`Detected @Hook providers but Better Auth 'hooks' are not configured${this.instances.size > 1 ? ` for instance '${instance.name}'` : ""}. Add 'hooks: {}' to your betterAuth(...) options.`,
+					);
+				}
+
+				const providerPrototype = Object.getPrototypeOf(provider.instance);
+				const methods =
+					this.metadataScanner.getAllMethodNames(providerPrototype);
+
+				for (const method of methods) {
+					const providerMethod = providerPrototype[method];
+					this.setupHooks(
+						providerMethod,
+						provider.instance,
+						instance.options,
+					);
+				}
 			}
 		}
 	}
 
 	configure(consumer: MiddlewareConsumer): void {
+		// Filter to instances that have controllers/middleware enabled
+		// and haven't been configured yet (prevents double middleware setup
+		// when multiple forRoot calls create separate module contexts)
+		const activeInstances = Array.from(this.instances.values()).filter(
+			(i) => !i.disableControllers && !i.options.auth._nestjsConfigured,
+		);
+
+		// Mark all active instances as configured
+		for (const instance of activeInstances) {
+			instance.options.auth._nestjsConfigured = true;
+		}
+
+		if (activeInstances.length === 0) return;
+
 		const adapterType = this.adapter.httpAdapter.getType();
-		const trustedOrigins = this.options.auth.options.trustedOrigins;
-		const bodyParserOptions = resolveBodyParserOptions(this.options);
-		// function-based trustedOrigins requires a Request (from web-apis) object to evaluate, which is not available in NestJS (we only have a express Request object)
-		// if we ever need this, take a look at better-call which show an implementation for this
-		const isNotFunctionBased = trustedOrigins && Array.isArray(trustedOrigins);
 
-		if (!this.options.disableTrustedOriginsCors && isNotFunctionBased) {
-			if (adapterType === "fastify") {
-				const fastifyInstance = this.adapter.httpAdapter.getInstance<{
-					hasRequestDecorator?: (name: string) => boolean;
-				}>();
-				const hasFastifyCorsRegistered =
-					fastifyInstance?.hasRequestDecorator?.("corsPreflightEnabled") ??
-					false;
+		// Collect all base paths for body parser skipping
+		const allBasePaths = activeInstances.map((i) => i.basePath);
 
-				if (hasFastifyCorsRegistered) {
-					this.logger.warn(
-						"Detected an existing @fastify/cors registration. Skipping automatic Fastify CORS registration for Better Auth trustedOrigins to avoid duplicate plugin registration. Better Auth routes will still apply CORS from trustedOrigins. Set disableTrustedOriginsCors: true if you want to fully manage Better Auth CORS yourself.",
-					);
-				} else {
-					this.adapter.httpAdapter.enableCors({
-						origin: trustedOrigins,
-						methods: ["GET", "POST", "PUT", "DELETE"],
-						credentials: true,
-					});
-				}
-			} else {
-				this.adapter.httpAdapter.enableCors({
-					origin: trustedOrigins,
-					methods: ["GET", "POST", "PUT", "DELETE"],
-					credentials: true,
-				});
-			}
-		} else if (
-			trustedOrigins &&
-			!this.options.disableTrustedOriginsCors &&
-			!isNotFunctionBased
-		)
-			throw new Error(
-				"Function-based trustedOrigins not supported in NestJS. Use string array or disable CORS with disableTrustedOriginsCors: true.",
-			);
+		// Use body parser options from the first active instance
+		const firstInstance = activeInstances[0];
+		const bodyParserOptions = resolveBodyParserOptions(firstInstance.options);
 
-		if ("disableBodyParser" in this.options) {
+		// Handle deprecation warnings (once per deprecation type)
+		if (
+			activeInstances.some((i) => "disableBodyParser" in i.options)
+		) {
 			this.logger.warn(
 				"`disableBodyParser` is deprecated. Use `bodyParser.json.enabled` and `bodyParser.urlencoded.enabled` instead.",
 			);
 		}
 
-		if ("enableRawBodyParser" in this.options) {
+		if (
+			activeInstances.some((i) => "enableRawBodyParser" in i.options)
+		) {
 			this.logger.warn(
 				"`enableRawBodyParser` is deprecated. Use `bodyParser.rawBody` instead.",
 			);
 		}
 
+		// Set up body parser skip middleware (Express only)
 		if (adapterType !== "fastify") {
 			consumer
 				.apply(
 					SkipBodyParsingMiddleware({
-						basePath: this.basePath,
+						basePaths: allBasePaths,
 						bodyParser: bodyParserOptions,
 					}),
 				)
@@ -207,56 +267,108 @@ export class AuthModule
 			configureFastifyBodyParser(this.adapter.httpAdapter, bodyParserOptions);
 		}
 
-		const handler = toNodeHandler(this.options.auth);
-		const authHandler = (
-			req: AdapterRequest,
-			res: AdapterResponse,
-			next: () => void,
-		) => {
-			if (!matchesBasePath(req, this.basePath)) {
-				next();
-				return;
-			}
+		// Set up CORS and auth handler for each active instance
+		for (const instance of activeInstances) {
+			const { options, basePath } = instance;
+			const trustedOrigins = options.auth.options.trustedOrigins;
+			const isNotFunctionBased =
+				trustedOrigins && Array.isArray(trustedOrigins);
 
-			if (
-				adapterType === "fastify" &&
-				!this.options.disableTrustedOriginsCors &&
-				isNotFunctionBased &&
-				handleFastifyTrustedOriginsCors(req, res, {
-					trustedOrigins,
-				})
-			) {
-				return;
-			}
+			if (!options.disableTrustedOriginsCors && isNotFunctionBased) {
+				if (adapterType === "fastify") {
+					const fastifyInstance = this.adapter.httpAdapter.getInstance<{
+						hasRequestDecorator?: (name: string) => boolean;
+					}>();
+					const hasFastifyCorsRegistered =
+						fastifyInstance?.hasRequestDecorator?.("corsPreflightEnabled") ??
+						false;
 
-			const nodeReq = getNodeRequest(req);
-			const nodeRes = getNodeResponse(res);
-
-			if (this.options.middleware) {
-				return this.options.middleware(req, res, () =>
-					handler(nodeReq, nodeRes),
+					if (hasFastifyCorsRegistered) {
+						this.logger.warn(
+							"Detected an existing @fastify/cors registration. Skipping automatic Fastify CORS registration for Better Auth trustedOrigins to avoid duplicate plugin registration. Better Auth routes will still apply CORS from trustedOrigins. Set disableTrustedOriginsCors: true if you want to fully manage Better Auth CORS yourself.",
+						);
+					} else {
+						this.adapter.httpAdapter.enableCors({
+							origin: trustedOrigins,
+							methods: ["GET", "POST", "PUT", "DELETE"],
+							credentials: true,
+						});
+					}
+				} else {
+					this.adapter.httpAdapter.enableCors({
+						origin: trustedOrigins,
+						methods: ["GET", "POST", "PUT", "DELETE"],
+						credentials: true,
+					});
+				}
+			} else if (
+				trustedOrigins &&
+				!options.disableTrustedOriginsCors &&
+				!isNotFunctionBased
+			)
+				throw new Error(
+					"Function-based trustedOrigins not supported in NestJS. Use string array or disable CORS with disableTrustedOriginsCors: true.",
 				);
-			}
-			return handler(nodeReq, nodeRes);
-		};
 
-		this.adapter.httpAdapter.use(
-			(
-				// biome-ignore lint/suspicious/noExplicitAny: adapter request type should not leak into the public declaration
-				req: any,
-				// biome-ignore lint/suspicious/noExplicitAny: adapter response type should not leak into the public declaration
-				res: any,
+			const handler = toNodeHandler(options.auth);
+			const authHandler = (
+				req: AdapterRequest,
+				res: AdapterResponse,
 				next: () => void,
-			) => authHandler(req as AdapterRequest, res as AdapterResponse, next),
-		);
-		this.logger.log(`AuthModule initialized BetterAuth on '${this.basePath}'`);
+			) => {
+				if (!matchesBasePath(req, basePath)) {
+					next();
+					return;
+				}
+
+				if (
+					adapterType === "fastify" &&
+					!options.disableTrustedOriginsCors &&
+					isNotFunctionBased &&
+					handleFastifyTrustedOriginsCors(req, res, {
+						trustedOrigins,
+					})
+				) {
+					return;
+				}
+
+				const nodeReq = getNodeRequest(req);
+				const nodeRes = getNodeResponse(res);
+
+				if (options.middleware) {
+					return options.middleware(req, res, () =>
+						handler(nodeReq, nodeRes),
+					);
+				}
+				return handler(nodeReq, nodeRes);
+			};
+
+			this.adapter.httpAdapter.use(
+				(
+					// biome-ignore lint/suspicious/noExplicitAny: adapter request type should not leak into the public declaration
+					req: any,
+					// biome-ignore lint/suspicious/noExplicitAny: adapter response type should not leak into the public declaration
+					res: any,
+					next: () => void,
+				) =>
+					authHandler(
+						req as AdapterRequest,
+						res as AdapterResponse,
+						next,
+					),
+			);
+			this.logger.log(
+				`AuthModule initialized BetterAuth${this.instances.size > 1 ? ` instance '${instance.name}'` : ""} on '${basePath}'`,
+			);
+		}
 	}
 
 	private setupHooks(
 		providerMethod: (...args: unknown[]) => unknown,
 		providerClass: { new (...args: unknown[]): unknown },
+		options: AuthModuleOptions,
 	) {
-		if (!this.options.auth.options.hooks) return;
+		if (!options.auth.options.hooks) return;
 
 		for (const { metadataKey, hookType } of HOOKS) {
 			const hasHook = Reflect.hasMetadata(metadataKey, providerMethod);
@@ -264,8 +376,8 @@ export class AuthModule
 
 			const hookPath = Reflect.getMetadata(metadataKey, providerMethod);
 
-			const originalHook = this.options.auth.options.hooks[hookType];
-			this.options.auth.options.hooks[hookType] = createAuthMiddleware(
+			const originalHook = options.auth.options.hooks[hookType];
+			options.auth.options.hooks[hookType] = createAuthMiddleware(
 				async (ctx) => {
 					if (originalHook) {
 						await originalHook(ctx);
@@ -279,77 +391,114 @@ export class AuthModule
 		}
 	}
 
-	static forRootAsync(options: typeof ASYNC_OPTIONS_TYPE): DynamicModule {
-		const forRootAsyncResult = super.forRootAsync(options);
-		const { module } = forRootAsyncResult;
-
-		return {
-			...forRootAsyncResult,
-			module: options.disableControllers
-				? AuthModuleWithoutControllers
-				: module,
-			controllers: options.disableControllers
-				? []
-				: forRootAsyncResult.controllers,
-			providers: [
-				...(forRootAsyncResult.providers ?? []),
-				...(!options.disableGlobalAuthGuard
-					? [
-							{
-								provide: APP_GUARD,
-								useClass: AuthGuard,
-							},
-						]
-					: []),
-			],
-		};
-	}
-
-	static forRoot(options: typeof OPTIONS_TYPE): DynamicModule;
+	static forRoot(options: AuthModuleForRootOptions): DynamicModule;
 	/**
 	 * @deprecated Use the object-based signature: AuthModule.forRoot({ auth, ...options })
 	 */
 	static forRoot(
 		auth: Auth,
-		options?: Omit<typeof OPTIONS_TYPE, "auth">,
+		options?: Omit<AuthModuleForRootOptions, "auth">,
 	): DynamicModule;
 	static forRoot(
-		arg1: Auth | typeof OPTIONS_TYPE,
-		arg2?: Omit<typeof OPTIONS_TYPE, "auth">,
+		arg1: Auth | AuthModuleForRootOptions,
+		arg2?: Omit<AuthModuleForRootOptions, "auth">,
 	): DynamicModule {
-		const normalizedOptions: typeof OPTIONS_TYPE =
+		const normalizedOptions: AuthModuleForRootOptions =
 			typeof arg1 === "object" && arg1 !== null && "auth" in (arg1 as object)
-				? (arg1 as typeof OPTIONS_TYPE)
-				: ({ ...(arg2 ?? {}), auth: arg1 as Auth } as typeof OPTIONS_TYPE);
+				? (arg1 as AuthModuleForRootOptions)
+				: ({
+						...(arg2 ?? {}),
+						auth: arg1 as Auth,
+					} as AuthModuleForRootOptions);
 
-		const forRootResult = super.forRoot(normalizedOptions);
-		const { module } = forRootResult;
+		const name = normalizedOptions.name || DEFAULT_AUTH_INSTANCE_NAME;
+		const optionsToken = getAuthOptionsToken(name);
+		const serviceToken = getAuthServiceToken(name);
+		const isDefault = name === DEFAULT_AUTH_INSTANCE_NAME;
+
+		_authInstanceNames.add(name);
+		AuthModule.instanceExtras.set(name, {
+			disableControllers: !!normalizedOptions.disableControllers,
+		});
 
 		return {
-			...forRootResult,
-			module: normalizedOptions.disableControllers
-				? AuthModuleWithoutControllers
-				: module,
-			controllers: normalizedOptions.disableControllers
-				? []
-				: forRootResult.controllers,
+			module: AuthModule,
+			imports: [DiscoveryModule],
+			global: normalizedOptions.isGlobal ?? true,
 			providers: [
-				...(forRootResult.providers ?? []),
-				...(!normalizedOptions.disableGlobalAuthGuard
+				{ provide: optionsToken, useValue: normalizedOptions },
+				{
+					provide: serviceToken,
+					useFactory: (opts: AuthModuleOptions) => new AuthService(opts),
+					inject: [optionsToken],
+				},
+				// Backward compat: default instance also provides MODULE_OPTIONS_TOKEN and AuthService
+				...(isDefault
 					? [
 							{
-								provide: APP_GUARD,
-								useClass: AuthGuard,
+								provide: MODULE_OPTIONS_TOKEN,
+								useExisting: optionsToken,
 							},
+							{ provide: AuthService, useExisting: serviceToken },
 						]
 					: []),
+				...(!normalizedOptions.disableGlobalAuthGuard
+					? [{ provide: APP_GUARD, useClass: AuthGuard }]
+					: []),
+			],
+			exports: [
+				optionsToken,
+				serviceToken,
+				...(isDefault ? [MODULE_OPTIONS_TOKEN, AuthService] : []),
 			],
 		};
 	}
-}
 
-class AuthModuleWithoutControllers extends AuthModule {
-	configure(): void {
-		return;
+	static forRootAsync(options: AuthModuleAsyncOptions): DynamicModule {
+		const name = options.name || DEFAULT_AUTH_INSTANCE_NAME;
+		const optionsToken = getAuthOptionsToken(name);
+		const serviceToken = getAuthServiceToken(name);
+		const isDefault = name === DEFAULT_AUTH_INSTANCE_NAME;
+
+		_authInstanceNames.add(name);
+		AuthModule.instanceExtras.set(name, {
+			disableControllers: !!options.disableControllers,
+		});
+
+		return {
+			module: AuthModule,
+			imports: [DiscoveryModule, ...(options.imports || [])],
+			global: options.isGlobal ?? true,
+			providers: [
+				{
+					provide: optionsToken,
+					useFactory: options.useFactory,
+					inject: options.inject || [],
+				},
+				{
+					provide: serviceToken,
+					useFactory: (opts: AuthModuleOptions) => new AuthService(opts),
+					inject: [optionsToken],
+				},
+				// Backward compat: default instance also provides MODULE_OPTIONS_TOKEN and AuthService
+				...(isDefault
+					? [
+							{
+								provide: MODULE_OPTIONS_TOKEN,
+								useExisting: optionsToken,
+							},
+							{ provide: AuthService, useExisting: serviceToken },
+						]
+					: []),
+				...(!options.disableGlobalAuthGuard
+					? [{ provide: APP_GUARD, useClass: AuthGuard }]
+					: []),
+			],
+			exports: [
+				optionsToken,
+				serviceToken,
+				...(isDefault ? [MODULE_OPTIONS_TOKEN, AuthService] : []),
+			],
+		};
 	}
 }

@@ -9,13 +9,16 @@ import {
 	Injectable,
 	UnauthorizedException,
 } from "@nestjs/common";
-import { Reflector } from "@nestjs/core";
+import { ModuleRef, Reflector } from "@nestjs/core";
 import type { getSession } from "better-auth/api";
 import { fromNodeHeaders } from "better-auth/node";
+import type { AuthModuleOptions } from "./auth-module-definition.ts";
 import {
-	type AuthModuleOptions,
-	MODULE_OPTIONS_TOKEN,
-} from "./auth-module-definition.ts";
+	AUTH_INSTANCE_NAME_KEY,
+	DEFAULT_AUTH_INSTANCE_NAME,
+	_authInstanceNames,
+	getAuthOptionsToken,
+} from "./symbols.ts";
 import { getRequestFromContext } from "./utils.ts";
 
 /**
@@ -126,15 +129,57 @@ const AuthContextErrorMap: Record<
 /**
  * NestJS guard that handles authentication for protected routes
  * Can be configured with @AllowAnonymous() or @OptionalAuth() decorators to modify authentication behavior
+ * Supports multiple named auth instances via @UseAuth() decorator
  */
 @Injectable()
 export class AuthGuard implements CanActivate {
 	constructor(
 		@Inject(Reflector)
 		private readonly reflector: Reflector,
-		@Inject(MODULE_OPTIONS_TOKEN)
-		private readonly options: AuthModuleOptions,
+		private readonly moduleRef: ModuleRef,
 	) {}
+
+	/**
+	 * Resolves the auth options for the current execution context.
+	 * Uses @UseAuth('name') metadata if present, otherwise falls back
+	 * to the default instance or the only registered instance.
+	 */
+	private getAuthOptions(context: ExecutionContext): AuthModuleOptions {
+		const instanceName = this.reflector.getAllAndOverride<string>(
+			AUTH_INSTANCE_NAME_KEY,
+			[context.getHandler(), context.getClass()],
+		);
+
+		const name = instanceName || DEFAULT_AUTH_INSTANCE_NAME;
+		const token = getAuthOptionsToken(name);
+
+		try {
+			return this.moduleRef.get(token, { strict: false });
+		} catch {
+			// If explicitly named but not found, throw a clear error
+			if (instanceName) {
+				throw new Error(
+					`Auth instance '${instanceName}' not found. Did you register it with AuthModule.forRoot({ name: '${instanceName}', ... })?`,
+				);
+			}
+
+			// No explicit name and no default instance — try to find any single registered instance
+			if (_authInstanceNames.size === 1) {
+				const onlyName = _authInstanceNames.values().next().value as string;
+				try {
+					return this.moduleRef.get(getAuthOptionsToken(onlyName), {
+						strict: false,
+					});
+				} catch {
+					// fall through to error
+				}
+			}
+
+			throw new Error(
+				"No auth instance found. Register one with AuthModule.forRoot(...) or specify the instance with @UseAuth('name').",
+			);
+		}
+	}
 
 	/**
 	 * Validates if the current request is authenticated
@@ -144,8 +189,9 @@ export class AuthGuard implements CanActivate {
 	 * @returns True if the request is authorized to proceed, throws an error otherwise
 	 */
 	async canActivate(context: ExecutionContext): Promise<boolean> {
+		const options = this.getAuthOptions(context);
 		const request = await getRequestFromContext(context);
-		const session: UserSession | null = await this.options.auth.api.getSession({
+		const session: UserSession | null = await options.auth.api.getSession({
 			headers: fromNodeHeaders(
 				request.headers || request?.handshake?.headers || [],
 			),
@@ -194,6 +240,7 @@ export class AuthGuard implements CanActivate {
 
 		if (requiredOrgRoles && requiredOrgRoles.length > 0) {
 			const hasOrgRole = await this.checkOrgRole(
+				options,
 				session,
 				headers,
 				requiredOrgRoles,
@@ -214,6 +261,7 @@ export class AuthGuard implements CanActivate {
 
 		if (permissionCheck) {
 			const hasPermission = await this.checkUserPermission(
+				options,
 				session,
 				headers,
 				permissionCheck,
@@ -231,6 +279,7 @@ export class AuthGuard implements CanActivate {
 
 		if (memberPermissionCheck) {
 			const hasMemberPermission = await this.checkMemberPermission(
+				options,
 				session,
 				headers,
 				memberPermissionCheck,
@@ -273,11 +322,12 @@ export class AuthGuard implements CanActivate {
 	 * @returns The member's role in the organization, or undefined if not found
 	 */
 	private async getMemberRoleInOrganization(
+		options: AuthModuleOptions,
 		headers: Headers,
 	): Promise<string | undefined> {
 		// Better Auth organization plugin exposes getActiveMemberRole or getActiveMember API
 		// biome-ignore lint/suspicious/noExplicitAny: Better Auth API types vary by plugin configuration
-		const authApi = this.options.auth.api as any;
+		const authApi = options.auth.api as any;
 
 		// Try getActiveMemberRole first (most direct for our use case)
 		if (typeof authApi.getActiveMemberRole === "function") {
@@ -318,6 +368,7 @@ export class AuthGuard implements CanActivate {
 	 * @returns True if org member role matches any required role
 	 */
 	private async checkOrgRole(
+		options: AuthModuleOptions,
 		session: UserSession,
 		headers: Headers,
 		requiredRoles: string[],
@@ -328,7 +379,7 @@ export class AuthGuard implements CanActivate {
 		}
 
 		try {
-			const memberRole = await this.getMemberRoleInOrganization(headers);
+			const memberRole = await this.getMemberRoleInOrganization(options, headers);
 			return this.matchesRequiredRole(memberRole, requiredRoles);
 		} catch (error) {
 			// Log error for debugging but return false to trigger 403 Forbidden
@@ -348,6 +399,7 @@ export class AuthGuard implements CanActivate {
 	 * @returns True if user has the required permissions
 	 */
 	private async checkUserPermission(
+		options: AuthModuleOptions,
 		session: UserSession,
 		headers: Headers,
 		permissionCheck: {
@@ -359,7 +411,7 @@ export class AuthGuard implements CanActivate {
 	): Promise<boolean> {
 		try {
 			// biome-ignore lint/suspicious/noExplicitAny: Better Auth API types vary by plugin configuration
-			const authApi = this.options.auth.api as any;
+			const authApi = options.auth.api as any;
 
 			// Check if userHasPermission API is available
 			if (typeof authApi.userHasPermission !== "function") {
@@ -428,6 +480,7 @@ export class AuthGuard implements CanActivate {
 	 * @returns True if member has the required permissions
 	 */
 	private async checkMemberPermission(
+		options: AuthModuleOptions,
 		session: UserSession,
 		headers: Headers,
 		permissionCheck: {
@@ -442,7 +495,7 @@ export class AuthGuard implements CanActivate {
 
 		try {
 			// biome-ignore lint/suspicious/noExplicitAny: Better Auth API types vary by plugin configuration
-			const authApi = this.options.auth.api as any;
+			const authApi = options.auth.api as any;
 
 			// Check if hasPermission API is available (organization plugin)
 			if (typeof authApi.hasPermission !== "function") {
