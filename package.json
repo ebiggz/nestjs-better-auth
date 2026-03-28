@@ -1,8 +1,8 @@
 {
-	"name": "@thallesp/nestjs-better-auth",
-	"version": "2.5.3",
+	"name": "@ebiggz/nestjs-better-auth",
+	"version": "2.6.0",
 	"description": "Better Auth for NestJS",
-	"author": "Thalles Passos",
+	"author": "Thalles Passos, Erik Bigler",
 	"license": "MIT",
 	"engines": {
 		"node": ">=22.22.1"

@@ -108,6 +108,7 @@ export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
 
 	private readonly logger = new Logger(AuthModule.name);
 	private readonly instances = new Map<string, ResolvedAuthInstance>();
+	private instancesResolved = false;
 
 	constructor(
 		@Inject(ApplicationConfig)
@@ -118,16 +119,46 @@ export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
 		private readonly metadataScanner: MetadataScanner,
 		@Inject(HttpAdapterHost)
 		private readonly adapter: HttpAdapterHost,
+		@Inject(ModuleRef)
 		private readonly moduleRef: ModuleRef,
-	) {
-		// Resolve all registered instances
+	) {}
+
+	/**
+	 * Resolves all registered auth instances from the DI container.
+	 * Called lazily (not in the constructor) because async providers
+	 * (e.g. from forRootAsync) may not be instantiated yet at
+	 * constructor time — ModuleRef.get() would throw silently.
+	 * By the time configure() runs, all providers are guaranteed
+	 * to be resolved.
+	 */
+	private resolveInstances(): void {
+		if (this.instancesResolved) return;
+		this.instancesResolved = true;
+
 		for (const name of Array.from(_authInstanceNames)) {
-			const token = getAuthOptionsToken(name);
-			let options: AuthModuleOptions;
-			try {
-				options = this.moduleRef.get(token, { strict: false });
-			} catch {
-				continue; // Registered by a different application context
+			const isDefault = name === DEFAULT_AUTH_INSTANCE_NAME;
+			let options: AuthModuleOptions | undefined;
+
+			// For the default instance, try MODULE_OPTIONS_TOKEN (Symbol) first.
+			// This is the same token the original ConfigurableModuleBuilder used,
+			// and we register the factory directly under it for backward compat.
+			if (isDefault) {
+				try {
+					options = this.moduleRef.get(MODULE_OPTIONS_TOKEN, { strict: false });
+				} catch {
+					// Symbol token not found, fall through to string token
+				}
+			}
+
+			// Fall back to the string-based token (used for named instances,
+			// or as a fallback for the default instance)
+			if (!options) {
+				const token = getAuthOptionsToken(name);
+				try {
+					options = this.moduleRef.get(token, { strict: false });
+				} catch {
+					continue; // Registered by a different application context
+				}
 			}
 
 			const basePath = normalizePath(
@@ -162,6 +193,8 @@ export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
 	}
 
 	onModuleInit(): void {
+		this.resolveInstances();
+
 		const providers = this.discoveryService
 			.getProviders()
 			.filter(
@@ -211,6 +244,8 @@ export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
 	}
 
 	configure(consumer: MiddlewareConsumer): void {
+		this.resolveInstances();
+
 		// Filter to instances that have controllers/middleware enabled
 		// and haven't been configured yet (prevents double middleware setup
 		// when multiple forRoot calls create separate module contexts)
@@ -465,30 +500,44 @@ export class AuthModule implements NestModule, OnModuleInit, OnModuleDestroy {
 			disableControllers: !!options.disableControllers,
 		});
 
+		// For the default instance, register the factory directly under
+		// MODULE_OPTIONS_TOKEN (the Symbol) — matching what the original
+		// ConfigurableModuleBuilder did. The string token aliases to it.
+		// For named instances, the string token is the primary provider.
+		const optionsProviders = isDefault
+			? [
+					{
+						provide: MODULE_OPTIONS_TOKEN,
+						useFactory: options.useFactory,
+						inject: options.inject || [],
+					},
+					{
+						provide: optionsToken,
+						useExisting: MODULE_OPTIONS_TOKEN,
+					},
+				]
+			: [
+					{
+						provide: optionsToken,
+						useFactory: options.useFactory,
+						inject: options.inject || [],
+					},
+				];
+
 		return {
 			module: AuthModule,
 			imports: [DiscoveryModule, ...(options.imports || [])],
 			global: options.isGlobal ?? true,
 			providers: [
-				{
-					provide: optionsToken,
-					useFactory: options.useFactory,
-					inject: options.inject || [],
-				},
+				...optionsProviders,
 				{
 					provide: serviceToken,
 					useFactory: (opts: AuthModuleOptions) => new AuthService(opts),
-					inject: [optionsToken],
+					inject: [isDefault ? MODULE_OPTIONS_TOKEN : optionsToken],
 				},
-				// Backward compat: default instance also provides MODULE_OPTIONS_TOKEN and AuthService
+				// Backward compat: default instance also provides AuthService class token
 				...(isDefault
-					? [
-							{
-								provide: MODULE_OPTIONS_TOKEN,
-								useExisting: optionsToken,
-							},
-							{ provide: AuthService, useExisting: serviceToken },
-						]
+					? [{ provide: AuthService, useExisting: serviceToken }]
 					: []),
 				...(!options.disableGlobalAuthGuard
 					? [{ provide: APP_GUARD, useClass: AuthGuard }]

@@ -136,6 +136,7 @@ export class AuthGuard implements CanActivate {
 	constructor(
 		@Inject(Reflector)
 		private readonly reflector: Reflector,
+		@Inject(ModuleRef)
 		private readonly moduleRef: ModuleRef,
 	) {}
 
